@@ -48,6 +48,7 @@ group.add_argument("-m", "--monthly", help="Save backup to 'monthly' folder", ac
 group.add_argument("-a", "--yearly", help="Save backup to 'yearly' folder", action="store_true")
 parser.add_argument("--rootdirectory", help="Specify a root directory to backup")
 parser.add_argument("--backupdirectory", help="Specify a directory to stage the temporary backup")
+parser.add_argument("--bucket", help="Specify an s3 bucket to store backup")
 parser.add_argument("--site", help="Specify a site to backup")
 parser.add_argument("--verbose", help="Print verbose output", action="store_true")
 parser.add_argument("--cleanup", help="Clean up backup directory", action="store_true")
@@ -101,7 +102,7 @@ def extractWordpressData(site_directory, backup_directory, site):
         return ''
     else:
         sql_file = os.path.join(backup_directory, site + "-" + year_month_day + ".sql")
-        mysql_dump_command = "/usr/bin/mysqldump -u " + database_user + " -p" + database_password + " " + database + " > " + sql_file
+        mysql_dump_command = "/usr/bin/mysqldump -u " + database_user + " -p\'" + database_password + "\' " + database + " > " + sql_file
         subprocess.run(mysql_dump_command, shell=True)
                 
     return sql_file
@@ -109,22 +110,27 @@ def extractWordpressData(site_directory, backup_directory, site):
 def sendToS3(tar_file, site):
     s3 = boto3.client('s3')
 
-    # Determine which bucket to store the backup
-    # Default to DEFAULT_BUCKET if there is no match
-    bucket = ''
-    response = s3.list_buckets()
-    buckets = [bucket['Name'] for bucket in response['Buckets']]
-    if (site in buckets):
-        bucket = site
-    else:
-        bucket = DEFAULT_BUCKET
+    # Set frequency and upload path
+    frequency = 'daily' if args.daily else 'monthly' if args.monthly else 'yearly'
+    upload_target = os.path.join(site, frequency, os.path.basename(tar_file))
+
+    # Identify what bucket/sub-bucket to store backup file
+    # 1.) Use specified s3 bucket if supplied
+    # 2.) If no s3 bucket specified, attempt to match site name to bucket name
+    # 3.) Default to DEFAULT_BUCKET if there is no match
+    bucket = args.bucket
+    if not bucket:
+        response = s3.list_buckets()
+        buckets = [bucket['Name'] for bucket in response['Buckets']]
+        if (site in buckets):
+            bucket = site
+            upload_target = os.path.join(frequency, os.path.basename(tar_file))
+        else:
+            bucket = DEFAULT_BUCKET
 
     if (args.verbose):
         print("S3 bucket: " + bucket + " selected")
 
-    # Identify what bucket/sub-bucket to store backup file
-    frequency = 'daily' if args.daily else 'monthly' if args.monthly else 'yearly'
-    upload_target = os.path.join("backup", frequency, os.path.basename(tar_file))
     s3.upload_file(tar_file, bucket, upload_target)
     if (args.verbose):
         print("Uploaded " + tar_file + " to s3://" + bucket + "/" + upload_target)
@@ -176,6 +182,9 @@ def backupSite(backup_directory, root_directory, site):
             
     # Gzip site files along with db backup
     tar_file = os.path.join(backup_directory, site + "-" + year_month_day + ".tar.gz")
+    if (args.verbose):
+        print("Creating " + tar_file)
+
     with tarfile.open(tar_file, "w:gz") as tar:
         tar.add(backup_site_directory, arcname=site)
         if (database_file):
@@ -183,6 +192,9 @@ def backupSite(backup_directory, root_directory, site):
         tar.close()
     
     # Send to AWS S3 to be stored in correct periodic folder (daily/monthly/yearly)
+    if (args.verbose):
+        print("Uploading to s3...")
+
     sendToS3(tar_file, site)
     
     # Cleanup temp location
@@ -194,7 +206,7 @@ def backupSite(backup_directory, root_directory, site):
 
 def main():
     # List out all directories in the root directory to get all sites
-    root_directory = args.rootdirectory or '/home/dchang/sites'
+    root_directory = args.rootdirectory or '/var/www'
     sites = [name for name in os.listdir(root_directory) if os.path.isdir(os.path.join(root_directory, name))]
 
     # Exit early if site specified is not found
